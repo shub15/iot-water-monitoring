@@ -4,6 +4,8 @@
 #include <DHT.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
+#include <EEPROM.h>
+#include "GravityTDS.h" // Add TDS library
 
 extern const char *AIO_NAME;
 extern const char *AIO_PASS;
@@ -33,6 +35,9 @@ LiquidCrystal_I2C lcd(0x27, 16, 2);
 // DHT sensor
 DHT dht(DHTPIN, DHTTYPE);
 
+// TDS sensor object
+GravityTDS gravityTds;
+
 // WiFi and MQTT clients
 WiFiClient client;
 Adafruit_MQTT_Client mqtt(&client, AIO_SERVER, AIO_SERVERPORT, AIO_NAME, AIO_PASS);
@@ -49,17 +54,20 @@ Adafruit_MQTT_Publish *tdsFeed;
 Adafruit_MQTT_Publish *tempFeed;
 Adafruit_MQTT_Publish *turbidityFeed;
 
-// TDS variables
-#define VREF 3.3
-#define SCOUNT 30
-int analogBuffer[SCOUNT];
-int analogBufferIndex = 0;
-
 void setup()
 {
   Serial.begin(115200);
 
-  // Configure ADC resolution to 12-bit (0-4095)
+  // Initialize EEPROM for TDS sensor calibration
+  EEPROM.begin(32);
+
+  // Configure TDS sensor
+  gravityTds.setPin(TDS_PIN);
+  gravityTds.setAref(3.3);      // ESP32 reference voltage
+  gravityTds.setAdcRange(4096); // ESP32 12-bit ADC
+  gravityTds.begin();           // Initialize TDS sensor
+
+  // Configure ADC
   analogReadResolution(12);
 
   // Set ADC attenuation for full 0-3.3V range
@@ -155,28 +163,14 @@ float readTemperature()
 
 float readTDS(float temperature)
 {
-  // Read TDS sensor from GPIO34
-  static unsigned long analogSampleTimepoint = millis();
-  if (millis() - analogSampleTimepoint > 40U)
-  {
-    analogSampleTimepoint = millis();
-    analogBuffer[analogBufferIndex] = analogRead(TDS_PIN);
-    analogBufferIndex++;
-    if (analogBufferIndex == SCOUNT)
-    {
-      analogBufferIndex = 0;
-    }
-  }
+  // Set temperature for automatic compensation
+  gravityTds.setTemperature(temperature);
 
-  // Calculate average voltage (ESP32 ADC is 12-bit: 0-4095)
-  float averageVoltage = getMedianNum(analogBuffer, SCOUNT) * (VREF / 4095.0);
+  // Update sensor reading
+  gravityTds.update();
 
-  // Temperature compensation
-  float compensationCoefficient = 1.0 + 0.02 * (temperature - 25.0);
-  float compensationVoltage = averageVoltage / compensationCoefficient;
-
-  // Convert to TDS value
-  float tdsValue = (133.42 * compensationVoltage * compensationVoltage * compensationVoltage - 255.86 * compensationVoltage * compensationVoltage + 857.39 * compensationVoltage) * 0.5;
+  // Get TDS value in ppm
+  float tdsValue = gravityTds.getTdsValue();
 
   return tdsValue;
 }
@@ -215,35 +209,6 @@ float readTurbidity()
     turbidityNTU = 0;
 
   return (turbidityNTU / 4095.0) * 100;
-}
-
-int getMedianNum(int bArray[], int iFilterLen)
-{
-  int bTab[iFilterLen];
-  for (byte i = 0; i < iFilterLen; i++)
-    bTab[i] = bArray[i];
-  int i, j, bTemp;
-  for (j = 0; j < iFilterLen - 1; j++)
-  {
-    for (i = 0; i < iFilterLen - j - 1; i++)
-    {
-      if (bTab[i] > bTab[i + 1])
-      {
-        bTemp = bTab[i];
-        bTab[i] = bTab[i + 1];
-        bTab[i + 1] = bTemp;
-      }
-    }
-  }
-  if ((iFilterLen & 1) > 0)
-  {
-    bTemp = bTab[(iFilterLen - 1) / 2];
-  }
-  else
-  {
-    bTemp = (bTab[iFilterLen / 2] + bTab[iFilterLen / 2 - 1]) / 2;
-  }
-  return bTemp;
 }
 
 void displayOnLCD(float temp, float tds, float ph, float turbidity)
