@@ -27,7 +27,7 @@ extern const char *pass;
 // ESP32 has multiple ADC pins - use different pins for each sensor
 #define TDS_PIN 34       // ADC1_CH6 (GPIO34)
 #define PH_PIN 35        // ADC1_CH7 (GPIO35)
-#define TURBIDITY_PIN 39 // ADC1_CH4 (GPIO32)
+#define TURBIDITY_PIN 32 // ADC1_CH4 (GPIO32)
 
 // LCD configuration (I2C pins: SDA=21, SCL=22)
 LiquidCrystal_I2C lcd(0x27, 16, 2);
