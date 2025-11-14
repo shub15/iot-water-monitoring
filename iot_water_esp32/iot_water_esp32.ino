@@ -1,11 +1,11 @@
-#include <WiFi.h> // ESP32 WiFi library
+#include <WiFi.h>
 #include "Adafruit_MQTT.h"
 #include "Adafruit_MQTT_Client.h"
 #include <DHT.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <EEPROM.h>
-#include "GravityTDS.h" // Add TDS library
+#include "GravityTDS.h"
 
 extern const char *AIO_NAME;
 extern const char *AIO_PASS;
@@ -21,15 +21,19 @@ extern const char *pass;
 #define AIO_SERVERPORT 1883
 
 // Sensor pins - ESP32 specific
-#define DHTPIN 15 // GPIO15 for DHT11
+#define DHTPIN 15        // GPIO15 for DHT11
 #define DHTTYPE DHT11
-
-// ESP32 has multiple ADC pins - use different pins for each sensor
 #define TDS_PIN 34       // ADC1_CH6 (GPIO34)
 #define PH_PIN 35        // ADC1_CH7 (GPIO35)
-#define TURBIDITY_PIN 32 // ADC1_CH4 (GPIO32)
+#define TURBIDITY_PIN 33 // GPIO33 (changed from 32)
 
-// LCD configuration (I2C pins: SDA=21, SCL=22)
+// Turbidity calibration for 1000 NTU sensor
+#define TURBIDITY_SAMPLES 20
+#define VOLTAGE_CLEAR_WATER 4.2    // Ideal voltage in clear water (0 NTU)
+#define VOLTAGE_MAX_TURBIDITY 2.5  // Voltage at 1000 NTU
+#define MAX_NTU 1000.0             // Your sensor's maximum range
+
+// LCD configuration
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 
 // DHT sensor
@@ -42,44 +46,49 @@ GravityTDS gravityTds;
 WiFiClient client;
 Adafruit_MQTT_Client mqtt(&client, AIO_SERVER, AIO_SERVERPORT, AIO_NAME, AIO_PASS);
 
-// Build feed path strings - MUST be kept in global scope
+// Build feed path strings
 String phFeedPath;
 String tdsFeedPath;
 String temperatureFeedPath;
 String turbidityFeedPath;
 
-// Declare feed objects (initialized in setup)
+// Declare feed objects
 Adafruit_MQTT_Publish *phFeed;
 Adafruit_MQTT_Publish *tdsFeed;
 Adafruit_MQTT_Publish *tempFeed;
 Adafruit_MQTT_Publish *turbidityFeed;
 
+// Store calibrated clear water voltage
+float calibratedClearVoltage = 3.3; // Will be measured during setup
+
 void setup()
 {
   Serial.begin(115200);
+  delay(1000);
 
-  // Initialize EEPROM for TDS sensor calibration
+  Serial.println("\n=== Water Quality Monitor v2.0 ===");
+  Serial.println("=== Turbidity Sensor: 0-1000 NTU ===\n");
+
+  // Initialize EEPROM
   EEPROM.begin(32);
 
   // Configure TDS sensor
   gravityTds.setPin(TDS_PIN);
-  gravityTds.setAref(3.3);      // ESP32 reference voltage
-  gravityTds.setAdcRange(4096); // ESP32 12-bit ADC
-  gravityTds.begin();           // Initialize TDS sensor
+  gravityTds.setAref(3.3);
+  gravityTds.setAdcRange(4096);
+  gravityTds.begin();
 
   // Configure ADC
   analogReadResolution(12);
-
-  // Set ADC attenuation for full 0-3.3V range
   analogSetAttenuation(ADC_11db);
 
-  // Build feed paths using String concatenation
+  // Build feed paths
   phFeedPath = String(AIO_NAME) + "/feeds/ph";
   tdsFeedPath = String(AIO_NAME) + "/feeds/tds";
   temperatureFeedPath = String(AIO_NAME) + "/feeds/temperature";
   turbidityFeedPath = String(AIO_NAME) + "/feeds/turbidity";
 
-  // Initialize feed objects using c_str() - safe because Strings persist
+  // Initialize feed objects
   phFeed = new Adafruit_MQTT_Publish(&mqtt, phFeedPath.c_str());
   tdsFeed = new Adafruit_MQTT_Publish(&mqtt, tdsFeedPath.c_str());
   tempFeed = new Adafruit_MQTT_Publish(&mqtt, temperatureFeedPath.c_str());
@@ -96,6 +105,43 @@ void setup()
 
   // Initialize DHT sensor
   dht.begin();
+
+  // Calibrate turbidity sensor
+  Serial.println("\n--- Turbidity Sensor Calibration ---");
+  Serial.println("IMPORTANT: Place sensor in CLEAN water for calibration!");
+  Serial.println("Reading in 3 seconds...");
+  delay(3000);
+  
+  // Take calibration reading
+  long sumCal = 0;
+  for (int i = 0; i < 20; i++)
+  {
+    sumCal += analogRead(TURBIDITY_PIN);
+    delay(50);
+  }
+  float avgADC = sumCal / 20.0;
+  calibratedClearVoltage = avgADC * (3.3 / 4095.0);
+  
+  Serial.print("Calibration Complete!");
+  Serial.print(" Clear Water Voltage: ");
+  Serial.print(calibratedClearVoltage, 3);
+  Serial.println("V");
+  
+  if (calibratedClearVoltage < 2.0 || calibratedClearVoltage > 3.3)
+  {
+    Serial.println("WARNING: Unusual voltage reading!");
+    Serial.println("Check sensor connection and power supply.");
+    Serial.println("Expected range: 2.5-3.3V in clear water");
+  }
+  
+  Serial.println("Calibration values:");
+  Serial.print("  Clear water (0 NTU): ");
+  Serial.print(calibratedClearVoltage, 2);
+  Serial.println("V = 100% clarity");
+  Serial.print("  Max turbidity (1000 NTU): ");
+  Serial.print(VOLTAGE_MAX_TURBIDITY, 2);
+  Serial.println("V = 0% clarity");
+  Serial.println("--------------------------------\n");
 
   // Connect to WiFi
   Serial.println("Connecting to WiFi...");
@@ -129,7 +175,6 @@ void loop()
   }
   mqtt.processPackets(10);
 
-  // Ping the server to keep the MQTT connection alive
   if (!mqtt.ping())
   {
     mqtt.disconnect();
@@ -139,15 +184,15 @@ void loop()
   float temperature = readTemperature();
   float tdsValue = readTDS(temperature);
   float phValue = readPH();
-  float turbidity = readTurbidity();
+  float turbidityPercent = readTurbidity();
 
   // Display on LCD
-  displayOnLCD(temperature, tdsValue, phValue, turbidity);
+  displayOnLCD(temperature, tdsValue, phValue, turbidityPercent);
 
   // Publish to Adafruit IO
-  publishToAdafruitIO(temperature, tdsValue, phValue, turbidity);
+  publishToAdafruitIO(temperature, tdsValue, phValue, turbidityPercent);
 
-  delay(10000); // Send data every 10 seconds
+  delay(10000);
 }
 
 float readTemperature()
@@ -156,28 +201,21 @@ float readTemperature()
   if (isnan(temp))
   {
     Serial.println("Failed to read from DHT sensor!");
-    return 25.0; // Default temperature
+    return 25.0;
   }
   return temp;
 }
 
 float readTDS(float temperature)
 {
-  // Set temperature for automatic compensation
   gravityTds.setTemperature(temperature);
-
-  // Update sensor reading
   gravityTds.update();
-
-  // Get TDS value in ppm
   float tdsValue = gravityTds.getTdsValue();
-
   return tdsValue;
 }
 
 float readPH()
 {
-  // Read pH sensor from GPIO35
   int measurings = 0;
   for (int i = 0; i < 10; i++)
   {
@@ -185,11 +223,8 @@ float readPH()
     delay(10);
   }
 
-  // ESP32 ADC is 12-bit: 0-4095
   float voltage = 3.3 / 4095.0 * measurings / 10;
   float phValue = 7.0 + ((2.5 - voltage) / 0.18);
-
-  // Constrain pH to valid range
   phValue = constrain(phValue, 0.0, 14.0);
 
   return phValue;
@@ -197,23 +232,45 @@ float readPH()
 
 float readTurbidity()
 {
-  // Read turbidity sensor from GPIO32
-  int sensorValue = analogRead(TURBIDITY_PIN);
-  float voltage = sensorValue * (3.3 / 4095.0);
+  long sum = 0;
 
-  // Convert voltage to NTU (calibration required)
-  float turbidityNTU = -1120.4 * voltage * voltage + 5742.3 * voltage - 4352.9;
+  for (int i = 0; i < TURBIDITY_SAMPLES; i++)
+  {
+    sum += analogRead(TURBIDITY_PIN);
+    delay(10);
+  }
 
-  // Ensure non-negative turbidity
-  if (turbidityNTU < 0)
-    turbidityNTU = 0;
+  float adc = sum / (float)TURBIDITY_SAMPLES;
+  float voltage = adc * (3.3 / 4095.0);
 
-  return (turbidityNTU / 4095.0) * 100;
+  // --- Correct turbidity calibration range ---
+  float clearWaterVoltage = calibratedClearVoltage;  // ~2.8 - 3.3V
+  float veryDirtyVoltage  = 1.2;  // Typical voltage in 1000 NTU
+
+  // Clamp voltage into valid range
+  if (voltage > clearWaterVoltage) voltage = clearWaterVoltage;
+  if (voltage < veryDirtyVoltage) voltage = veryDirtyVoltage;
+
+  // Map to 0–100% clarity
+  float clarity = (voltage - veryDirtyVoltage) * 100.0 /
+                  (clearWaterVoltage - veryDirtyVoltage);
+
+  clarity = constrain(clarity, 0, 100);
+
+  Serial.print("Turbidity | ADC:");
+  Serial.print(adc);
+  Serial.print("  Voltage:");
+  Serial.print(voltage, 3);
+  Serial.print(" V  Clarity:");
+  Serial.print(clarity, 1);
+  Serial.println("%");
+
+  return clarity;
 }
+
 
 void displayOnLCD(float temp, float tds, float ph, float turbidity)
 {
-  // Display alternating sensor data on LCD
   static unsigned long lastSwitch = 0;
   static int displayMode = 0;
 
@@ -242,8 +299,8 @@ void displayOnLCD(float temp, float tds, float ph, float turbidity)
       lcd.print("ppm");
 
       lcd.setCursor(0, 1);
-      lcd.print("Turb:");
-      lcd.print(turbidity, 1);
+      lcd.print("Clarity:");
+      lcd.print(turbidity, 0);
       lcd.print("%");
     }
   }
@@ -251,38 +308,57 @@ void displayOnLCD(float temp, float tds, float ph, float turbidity)
 
 void publishToAdafruitIO(float temp, float tds, float ph, float turbidity)
 {
-  Serial.print("Publishing - Temp: ");
-  Serial.print(temp);
-  Serial.print(" | TDS: ");
-  Serial.print(tds);
-  Serial.print(" | pH: ");
-  Serial.print(ph);
-  Serial.print(" | Turbidity: ");
-  Serial.println(turbidity);
+  Serial.println("\n--- Publishing to Adafruit IO ---");
+  Serial.print("Temp: ");
+  Serial.print(temp, 1);
+  Serial.print("°C | TDS: ");
+  Serial.print(tds, 0);
+  Serial.print("ppm | pH: ");
+  Serial.print(ph, 2);
+  Serial.print(" | Clarity: ");
+  Serial.print(turbidity, 1);
+  Serial.println("%");
 
-  // Use arrow operator -> since feeds are pointers
   if (!tempFeed->publish(temp))
   {
-    Serial.println("Failed to publish temperature");
+    Serial.println("✗ Failed to publish temperature");
+  }
+  else
+  {
+    Serial.println("✓ Temperature published");
   }
   delay(100);
 
   if (!tdsFeed->publish(tds))
   {
-    Serial.println("Failed to publish TDS");
+    Serial.println("✗ Failed to publish TDS");
+  }
+  else
+  {
+    Serial.println("✓ TDS published");
   }
   delay(100);
 
   if (!phFeed->publish(ph))
   {
-    Serial.println("Failed to publish pH");
+    Serial.println("✗ Failed to publish pH");
+  }
+  else
+  {
+    Serial.println("✓ pH published");
   }
   delay(100);
 
   if (!turbidityFeed->publish(turbidity))
   {
-    Serial.println("Failed to publish turbidity");
+    Serial.println("✗ Failed to publish turbidity");
   }
+  else
+  {
+    Serial.println("✓ Turbidity published");
+  }
+
+  Serial.println("--- Publish Complete ---\n");
 }
 
 void connectMQTT()
@@ -292,12 +368,21 @@ void connectMQTT()
   lcd.print("Connecting AIO");
 
   int8_t ret;
+  uint8_t retries = 0;
+
   while ((ret = mqtt.connect()) != 0)
   {
     Serial.println(mqtt.connectErrorString(ret));
     Serial.println("Retrying in 5 seconds...");
     mqtt.disconnect();
     delay(5000);
+
+    retries++;
+    if (retries > 5)
+    {
+      Serial.println("Failed to connect to MQTT after 5 attempts. Restarting...");
+      ESP.restart();
+    }
   }
 
   Serial.println("Adafruit IO Connected!");
